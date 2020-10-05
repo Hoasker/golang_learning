@@ -6,440 +6,390 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"io"
 	"log"
-	"net/http"
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
-	"text/template"
 )
 
-//APIMethodProperties - apigen:api fields
-type apiMethodProperties struct {
-	URL    string `json:"url"`
-	Auth   bool   `json:"auth"`
-	Method string `json:"method"`
-	Name   string
-	Owner  string
-	Params methodParamsStruct
-}
-type methodParamsStruct struct {
-	StructName string
-	fields     []validationProps
-}
-
-type validationProps struct {
-	fieldname   string
-	paramName   string
-	fieldType   string
-	required    bool
-	min         int
-	min_flag    bool
-	max         int
-	max_flag    bool
-	enum        bool
-	enumVals    []string
-	defaultVal  string
-	defaultFlag bool
-}
-
-func (valp *validationProps) parseTag(tag string) {
-
-	indx := strings.Index(tag, "apivalidator:")
-	if indx == -1 {
-		return
-	}
-	splt := tag[indx+len("apivalidator:")+1 : len(tag)-1]
-	fmt.Println(splt)
-	spltArr := strings.Split(splt, ",")
-	fmt.Println(spltArr)
-	for _, elem := range spltArr {
-		spltElem := strings.Split(elem, "=")
-		if len(spltElem) < 1 {
-			continue
-		}
-		switch spltElem[0] {
-		case "required":
-			{
-				valp.required = true
-			}
-		case "min":
-			{
-				valp.min_flag = true
-				i1, err := strconv.Atoi(spltElem[1])
-				if err != nil {
-					continue
-				}
-				valp.min = i1
-			}
-		case "max":
-			{
-				valp.max_flag = true
-				i1, err := strconv.Atoi(spltElem[1])
-				if err != nil {
-					continue
-				}
-				valp.max = i1
-			}
-		case "paramname":
-			{
-				valp.paramName = spltElem[1]
-			}
-		case "default":
-			{
-				valp.defaultFlag = true
-				valp.defaultVal = spltElem[1]
-			}
-		case "enum":
-			{
-				valp.enum = true
-				valp.enumVals = strings.Split(spltElem[1], "|")
-			}
-		default:
-			{
-				continue
-			}
-		}
-	}
-}
-
-type tpl struct {
-	ApiName         string
-	UsrCases        string
-	MethodName      string
-	ParamStructName string
-	AuthCode        string
-	MethodCheckCode string
-	ParseGetCode    string
-	ParsePostCode   string
-	ValidationCode  string
-}
-
-var (
-	intTpl = template.Must(template.New("httpHandlerTpl").Parse(`
-	// {{.ApiName}}
-	func (srv *{{.ApiName}}) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-{{.UsrCases}}
-		default:
-			resJSON, _ := json.Marshal(map[string]string{"error": "unknown method"})
-			http.Error(w, string(resJSON), http.StatusNotFound)
-			// 404
-		}
-	}
-`))
-
-	wrappetTpl = template.Must(template.New("wrapperHandlerTpl").Parse(`
-
-	
-	func (srv *{{.ApiName}}) wrapper{{.ApiName}}{{.MethodName}}(w http.ResponseWriter, r *http.Request) {
-		// заполнение структуры params
-		// валидирование параметров
-		fmt.Println("")
-		ctx := r.Context()
-		var params {{.ParamStructName}}
-
-		{{.AuthCode}}
-
-		{{.MethodCheckCode}}
-
-		{{.ParseGetCode}}
-
-		{{.ParsePostCode}}
-
-		{{.ValidationCode}}
-	
-		fmt.Printf("Request {{.MethodName}} \n")
-	
-		res, err := srv.{{.MethodName}}(ctx, params)
-		if err != nil {
-			switch err.(type) {
-			case ApiError:
-				err := err.(ApiError)
-				resJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
-				http.Error(w, string(resJSON), err.HTTPStatus)
-			default:
-				resJSON, _ := json.Marshal(map[string]string{"error": err.Error()})
-				http.Error(w, string(resJSON), 500)
-			}
-			return
-		}
-	
-		resultJSON, _ := json.Marshal(map[string]interface{}{"response": res, "error": ""})
-		fmt.Fprintf(w, string(resultJSON))
-	
-		return
-		// прочие обработки
-	}
-	`))
+const topDeclarations = `
+import (
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strconv"
 )
-
-func makeWrapperMethodName(methodName string, parentStruct string) string {
-	return "wrapper" + parentStruct + methodName
-}
-
-func writeHTTPHandlers(w io.Writer, meths []apiMethodProperties, structName string) {
-	cases := ""
-	for _, sre := range meths {
-		cases += "\t\tcase \"" + sre.URL + "\" :\n{\n\t\t\t"
-		cases += "srv." + makeWrapperMethodName(sre.Name, structName) + "(w,r) \n\t\t}\n"
+var _ = strconv.Atoi // build fails if strconv is imported and not used
+func writeHeader(w http.ResponseWriter, result handleResult) {
+	if result.err == nil {
+		return
 	}
-	var tl tpl
-	tl.ApiName = structName
-	tl.UsrCases = cases
-	intTpl.Execute(w, tl)
-}
-
-func errortojson(msg string, status int) string {
-	res := ""
-	res += "    resJSON, _ := json.Marshal(map[string]string{\"error\": \"" + msg + "\"})\n"
-	res += "    http.Error(w, string(resJSON), " + strconv.Itoa(status) + ")\n"
-	return res
-}
-func generateParamsForGET(meth *apiMethodProperties) string {
-	res := "if r.Method == http.MethodGet {\n"
-	for _, j := range meth.Params.fields {
-		if len(j.paramName) < 1 {
-			j.paramName = strings.ToLower(j.fieldname)
-		}
-		res += "" + j.fieldname + ",ok := r.URL.Query()[\"" + j.paramName + "\"]\n"
-		if j.required {
-			res += "if !ok || len(" + j.fieldname + "[0]) < 1 {\n"
-			res += errortojson(j.paramName+" must me not empty", http.StatusBadRequest)
-			res += "    return\n"
-			res += "}\n"
-		}
-		if j.fieldType == "int" {
-			res += "i1, err := strconv.Atoi(" + j.paramName + ")\n"
-			res += "if err != nil {\n"
-			res += errortojson(j.paramName+" must be int", http.StatusBadRequest)
-			res += "}\n"
-			res += "params." + j.fieldname + " = i1\n"
-		} else {
-			res += "params." + j.fieldname + " = " + j.fieldname + "[0]\n"
-		}
+	if apiErr, ok := result.err.(ApiError); ok {
+		w.WriteHeader(apiErr.HTTPStatus)
+		return
 	}
-
-	res += "}\n"
-	return res
+	w.WriteHeader(http.StatusInternalServerError)
 }
-func generateParamsForPOST(meth *apiMethodProperties) string {
-	res := "if r.Method == http.MethodPost {\n"
-	res += "r.ParseForm()\n"
-
-	for _, j := range meth.Params.fields {
-		if len(j.paramName) < 1 {
-			j.paramName = strings.ToLower(j.fieldname)
-		}
-
-		res += j.fieldname + " := r.FormValue(\"" + j.paramName + "\")\n"
-		res += "if len(" + j.fieldname + ") < 1 {\n"
-		if j.required {
-			res += errortojson(j.paramName+" must me not empty", http.StatusBadRequest)
-			res += "    return\n"
-		}
-		if j.defaultFlag {
-			res += "params." + j.fieldname + " = \"" + j.defaultVal + "\"\n"
-		}
-		res += "}else{\n"
-		if j.fieldType == "int" {
-			res += "i1, err := strconv.Atoi(" + j.fieldname + ")\n"
-			res += "if err != nil {\n"
-			res += errortojson(j.paramName+" must be int", http.StatusBadRequest)
-			res += "    return\n"
-			res += "}\n"
-			res += "params." + j.fieldname + " = i1\n"
-		} else {
-			res += "params." + j.fieldname + " = " + j.fieldname + "\n"
-		}
-		res += "}\n"
+func writeBody(w http.ResponseWriter, result handleResult) {
+	body := Body{
+		Response: result.response,
 	}
-
-	res += "}\n"
-	return res
+	if result.err != nil {
+		body.Error = result.err.Error()
+	}
+	bodyBytes, _ := json.Marshal(body)
+	w.Write(bodyBytes)
 }
-
-func generateValidationCode(meth *apiMethodProperties) string {
-	res := ""
-	for _, j := range meth.Params.fields {
-		if len(j.paramName) < 1 {
-			j.paramName = strings.ToLower(j.fieldname)
-		}
-		if j.enum {
-			res += "var " + j.fieldname + "Enum []string\n"
-			for _, k := range j.enumVals {
-				res += j.fieldname + "Enum = append(" + j.fieldname + "Enum," + "\"" + k + "\")\n"
-				//" + strconv.Itoa(len(j.enumVals)) + "
-				//res += j.fieldname + "Enum[" + strconv.Itoa(idx) + "] = \"" + k + "\"\n"
-			}
-			res += "if !contains(" + j.fieldname + "Enum, params." + j.fieldname + ") { \n"
-			res += errortojson(j.paramName+" must be one of [\"+strings.Join("+j.fieldname+"Enum ,\", \" )+\"]", http.StatusBadRequest)
-			res += "    return\n"
-			res += "}\n"
-		}
-		if j.fieldType == "int" {
-			if j.min_flag {
-				res += "if params." + j.fieldname + " < " + strconv.Itoa(j.min) + " {\n"
-				res += errortojson(j.paramName+" must be >= "+strconv.Itoa(j.min), http.StatusBadRequest)
-				res += "    return\n"
-				res += "}\n"
-			}
-			if j.max_flag {
-				res += "if params." + j.fieldname + " > " + strconv.Itoa(j.max) + " {\n"
-				res += errortojson(j.paramName+" must be <= "+strconv.Itoa(j.max), http.StatusBadRequest)
-				res += "    return\n"
-				res += "}\n"
-			}
-		} else {
-			if j.min_flag {
-				res += "if len(params." + j.fieldname + ") < " + strconv.Itoa(j.min) + " {\n"
-				res += errortojson(j.paramName+" len must be >= "+strconv.Itoa(j.min), http.StatusBadRequest)
-				res += "    return\n"
-				res += "}\n"
-			}
-			if j.max_flag {
-				res += "if len(params." + j.fieldname + ") > " + strconv.Itoa(j.max) + " {\n"
-				res += errortojson(j.paramName+" len must be <= "+strconv.Itoa(j.max), http.StatusBadRequest)
-				res += "    return\n"
-				res += "}\n"
-			}
-		}
-
-	}
-	return res
+type handleResult struct {
+	err      error
+	response interface{}
 }
-func writeWrapper(w io.Writer, meth apiMethodProperties) {
-	//здесь генерируем конкретный враппер для текущего метода
-	//0 проверяем авторизацию
-	//1 определяем тип запроса
-	//2 находим параметры метода и объявляем заглушку для хранения параметров
-	//3 парсим гет
-	//4 парсим пост
-	//5 валидируем
-	//6 выполняем метод
-	//7 парсим ошибки
-	//8 выводим результат
-	var tl tpl
-	tl.ApiName = meth.Owner
-	tl.MethodName = meth.Name
-	tl.ParamStructName = meth.Params.StructName
-
-	if meth.Auth {
-		tl.AuthCode = "cookie:= r.Header.Get(\"X-Auth\")\n"
-		tl.AuthCode += "if cookie != \"100500\" { \n"
-		tl.AuthCode += "    resJSON, _ := json.Marshal(map[string]string{\"error\": \"unauthorized\"})\n"
-		tl.AuthCode += "    http.Error(w, string(resJSON), 403)\n"
-		tl.AuthCode += "    return\n"
-		tl.AuthCode += "}\n"
-	}
-
-	tl.ParsePostCode = generateParamsForPOST(&meth)
-	if meth.Method == "POST" {
-		tl.MethodCheckCode += "if r.Method == http.MethodGet { \n"
-		tl.MethodCheckCode += "    resJSON, _ := json.Marshal(map[string]string{\"error\": \"bad method\"})\n"
-		tl.MethodCheckCode += "    http.Error(w, string(resJSON), http.StatusNotAcceptable)\n"
-		tl.MethodCheckCode += "    return\n"
-		tl.MethodCheckCode += "}\n"
-	} else {
-		tl.ParseGetCode = generateParamsForGET(&meth)
-	}
-
-	tl.ValidationCode = generateValidationCode(&meth)
-
-	wrappetTpl.Execute(w, tl)
+type Body struct {
+	Error    string      "json:\"error\""
+	Response interface{} "json:\"response,omitempty\""
 }
+`
 
 func main() {
-
-	apis := map[string][]apiMethodProperties{}
+	inputPath := os.Args[1]
+	outputPath := os.Args[2]
 
 	fset := token.NewFileSet()
-	node, err := parser.ParseFile(fset, os.Args[1], nil, parser.ParseComments)
+	node, err := parser.ParseFile(fset, inputPath, nil, parser.ParseComments)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	out, _ := os.Create(os.Args[2])
+	funcsToServe := selectFuncsToServe(*node)
+	groupedFuncsByReceiver := groupFuncsByReceiver(funcsToServe)
+
+	structs := selectStructs(*node)
+
+	out, err := os.Create(outputPath)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	fmt.Fprintln(out, `package `+node.Name.Name)
-	fmt.Fprintln(out) // empty line
-	fmt.Fprintln(out, `import "encoding/json"`)
-	fmt.Fprintln(out, `import "fmt"`)
-	fmt.Fprintln(out, `import "net/http"`)
-	fmt.Fprintln(out, `import "strconv"`)
-	fmt.Fprintln(out) // empty line
-	fmt.Fprintln(out, `	func contains(slice []string, item string) bool {
-		set := make(map[string]struct{}, len(slice))
-		for _, s := range slice {
-			set[s] = struct{}{}
-		}
-	
-		_, ok := set[item] 
-		return ok
-	}`)
+	fmt.Fprintln(out)
+	fmt.Fprintln(out, topDeclarations)
 
-	for _, f := range node.Decls {
-		g, ok := f.(*ast.FuncDecl)
+	generateServeHTTP(out, groupedFuncsByReceiver, structs)
+}
+
+func selectFuncsToServe(node ast.File) []ast.FuncDecl {
+	var result []ast.FuncDecl
+
+	for _, decl := range node.Decls {
+		funcDecl, ok := decl.(*ast.FuncDecl)
 		if !ok {
-			//fmt.Printf("SKIP %T is not *ast.FuncDecl\n", f)
-			continue
-		}
-		if g.Doc == nil {
 			continue
 		}
 
-		fmt.Println(g.Name.String() + " ")
-		tag := g.Doc.List[len(g.Doc.List)-1].Text
-
-		indx := strings.Index(tag, "apigen:api")
-		if indx == -1 {
+		if funcDecl.Doc == nil {
 			continue
 		}
 
-		res := apiMethodProperties{}
-		json.Unmarshal([]byte(tag[indx+len("apigen:api"):]), &res)
-		res.Name = g.Name.Name
-		fmt.Println(tag)
-		fmt.Println("A" + strconv.FormatBool(res.Auth))
-		fmt.Println("M" + res.Method)
-		fmt.Println("U" + res.URL)
+		hasComment, _ := getFuncComment(*funcDecl)
+		if hasComment {
+			result = append(result, *funcDecl)
+		}
+	}
 
-		switch t := g.Recv.List[0].Type.(type) {
-		case *ast.StarExpr:
-			switch str := t.X.(type) {
-			case *ast.Ident:
-				position := fset.Position(str.NamePos)
-				fmt.Printf("	%s:%d %s\r\n", position.Filename, position.Line, str.Name)
-				res.Owner = str.Name
-			default:
+	return result
+}
+
+func getFuncComment(funcDecl ast.FuncDecl) (hasComment bool, comment string) {
+	const apiGenPrefix = "// apigen:api "
+
+	for _, comment := range funcDecl.Doc.List {
+		if strings.HasPrefix(comment.Text, apiGenPrefix) {
+			return true, comment.Text[len(apiGenPrefix):]
+		}
+	}
+	return false, ""
+}
+
+func groupFuncsByReceiver(funcs []ast.FuncDecl) map[string][]ast.FuncDecl {
+	result := make(map[string][]ast.FuncDecl)
+
+	for _, f := range funcs {
+		receiverName := f.Recv.List[0].Type.(*ast.StarExpr).X.(*ast.Ident).Name
+		funcsByReciver := result[receiverName]
+		result[receiverName] = append(funcsByReciver, f)
+	}
+
+	return result
+}
+
+func selectStructs(node ast.File) map[string]ast.TypeSpec {
+	var result = make(map[string]ast.TypeSpec)
+
+	for _, decl := range node.Decls {
+		genDecl, ok := decl.(*ast.GenDecl)
+		if !ok {
+			continue
+		}
+
+		for _, spec := range genDecl.Specs {
+			currType, ok := spec.(*ast.TypeSpec)
+			if !ok {
 				continue
 			}
-		default:
+
+			_, ok = currType.Type.(*ast.StructType)
+			if !ok {
+				continue
+			}
+
+			result[currType.Name.Name] = *currType
+		}
+	}
+
+	return result
+}
+
+func generateServeHTTP(out *os.File, groupedFuncsByReceiver map[string][]ast.FuncDecl, structs map[string]ast.TypeSpec) {
+	for receiver, funcDecls := range groupedFuncsByReceiver {
+		fmt.Fprintf(out, `
+func (api *%s) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var handleResult handleResult
+	switch r.URL.Path {
+`, receiver)
+
+		for _, funcDecl := range funcDecls {
+			_, comment := getFuncComment(funcDecl)
+
+			var funcTag FuncTag
+			_ = json.Unmarshal([]byte(comment), &funcTag)
+
+			fmt.Fprintf(out, `	case "%s":
+`, funcTag.Url)
+
+			if funcTag.Method != "" {
+				fmt.Fprintf(out, `		if r.Method != "%s" {
+			handleResult.err = ApiError{
+				HTTPStatus: 406,
+				Err:        fmt.Errorf("bad method"),
+			}
+			break
+		}
+`, funcTag.Method)
+			}
+
+			if funcTag.Auth {
+				fmt.Fprintf(out, `		if r.Header.Get("X-Auth") != "100500" {
+					handleResult.err = ApiError{
+						HTTPStatus: 403,
+						Err:        fmt.Errorf("unauthorized"),
+					}
+					break
+				}
+`)
+			}
+
+			paramStructName := funcDecl.Type.Params.List[1].Type.(*ast.Ident).Name
+			s := structs[paramStructName]
+
+			fmt.Fprintf(out, "		var param %s\n", paramStructName)
+
+			generateParamInit(out, s)
+
+			fmt.Fprintf(out, "		response, err := api.%s(r.Context(), param)\n", funcDecl.Name.Name)
+			fmt.Fprintf(out, `
+		if err != nil {
+			handleResult.err = err
+			break
+		}
+`)
+
+			fmt.Fprintln(out, `		handleResult.response = response`)
+		}
+
+		fmt.Fprintln(out, `
+	default:
+		handleResult.err = ApiError{
+			HTTPStatus: 404,
+			Err:        fmt.Errorf("unknown method"),
+		}
+	}
+	writeHeader(w, handleResult)
+	writeBody(w, handleResult)
+}`)
+	}
+}
+
+type FuncTag struct {
+	Url    string `"json:"url"`
+	Auth   bool   `"json:"auth"`
+	Method string `"json:"method"`
+}
+
+func generateParamInit(out *os.File, s ast.TypeSpec) {
+	for _, field := range s.Type.(*ast.StructType).Fields.List {
+		fieldName := field.Names[0].Name
+
+		formValueVarName := "formValue" + fieldName
+		parsedVarName := "parsed" + fieldName
+		assignToVar := formValueVarName
+
+		fieldTag := parseTag(*field)
+
+		var paramName string
+		if fieldTag.paramname == "" {
+			paramName = strings.ToLower(fieldName)
+		} else {
+			paramName = fieldTag.paramname
+		}
+
+		fmt.Fprintf(out, `		%s := r.FormValue("%s")
+`, formValueVarName, paramName)
+
+		if fieldTag.dflt != "" {
+			fmt.Fprintf(out, `		if %s == "" {
+			%s = "%s"
+		}
+`, formValueVarName, formValueVarName, fieldTag.dflt)
+		}
+
+		if fieldTag.required {
+			fmt.Fprintf(out, `		if %s == "" {
+			handleResult.err = ApiError{
+				HTTPStatus: http.StatusBadRequest,
+				Err:        fmt.Errorf("%s must me not empty"),
+			}
+			break
+		}
+`, formValueVarName, paramName)
+		}
+
+		filedIsInt := field.Type.(*ast.Ident).Name == "int"
+
+		if filedIsInt {
+			fmt.Fprintf(out, `		%s, err := strconv.Atoi(%s)
+		if err != nil {
+			handleResult.err = ApiError{
+				HTTPStatus: 400,
+				Err:        fmt.Errorf("%s must be int"),
+			}
+			break
+		}
+`, parsedVarName, formValueVarName, paramName)
+			assignToVar = parsedVarName
+		}
+
+		if fieldTag.hasMin {
+			if filedIsInt {
+				fmt.Fprintf(out, `		if %s < %d {
+			handleResult.err = ApiError{
+				HTTPStatus: 400,
+				Err:        fmt.Errorf("%s must be >= %d"),
+			}
+			break
+		}
+`, parsedVarName, fieldTag.min, paramName, fieldTag.min)
+			} else {
+				fmt.Fprintf(out, `		if len(%s) < %d {
+			handleResult.err = ApiError{
+				HTTPStatus: 400,
+				Err:        fmt.Errorf("%s len must be >= %d"),
+			}
+			break
+		}
+`, formValueVarName, fieldTag.min, paramName, fieldTag.min)
+			}
+		}
+
+		if fieldTag.hasMax {
+			if filedIsInt {
+				fmt.Fprintf(out, `		if %s > %d {
+			handleResult.err = ApiError{
+				HTTPStatus: 400,
+				Err:        fmt.Errorf("%s must be <= %d"),
+			}
+			break
+		}
+`, parsedVarName, fieldTag.max, paramName, fieldTag.max)
+			} else {
+				fmt.Fprintf(out, `		if len(%s) > %d {
+			handleResult.err = ApiError{
+				HTTPStatus: 400,
+				Err:        fmt.Errorf("%s len must be <= %d"),
+			}
+			break
+		}
+`, formValueVarName, fieldTag.max, paramName, fieldTag.max)
+			}
+		}
+
+		validEnumValuesVarName := paramName + "ValidEnumValues"
+
+		if len(fieldTag.enum) > 0 {
+			fmt.Fprintf(out, "		%s := map[string]bool{", validEnumValuesVarName)
+			fmt.Fprintln(out)
+			for _, enumValue := range fieldTag.enum {
+				fmt.Fprintf(out, `			"%s": true,
+`, enumValue)
+			}
+			fmt.Fprintln(out, "}")
+
+			fmt.Fprintf(out, `		if !%s[%s] {
+			handleResult.err = ApiError{
+				HTTPStatus: 400,
+				Err:        fmt.Errorf("%s must be one of [%s]"),
+			}
+			break
+		}
+`, validEnumValuesVarName, formValueVarName, paramName, strings.Join(fieldTag.enum, ", "))
+		}
+
+		fmt.Fprintf(out, "		param.%s = %s\n\n", fieldName, assignToVar)
+	}
+
+}
+
+func parseTag(field ast.Field) tagParseResult {
+	fieldTag := reflect.StructTag(field.Tag.Value[1 : len(field.Tag.Value)-1])
+	apivalidator := fieldTag.Get("apivalidator")
+
+	result := tagParseResult{}
+
+	for _, item := range strings.Split(apivalidator, ",") {
+		if item == "required" {
+			result.required = true
 			continue
 		}
 
-		parastr := g.Type.Params.List[1].Type.(*ast.Ident)
-		res.Params.StructName = parastr.String()
-		parastrObj := parastr.Obj.Decl.(*ast.TypeSpec)
-		paratype := parastrObj.Type.(*ast.StructType)
-		for _, vall := range paratype.Fields.List {
-			var props validationProps
-			props.fieldType = vall.Type.(*ast.Ident).String()
-			props.fieldname = vall.Names[0].String()
-			props.parseTag(vall.Tag.Value[1 : len(vall.Tag.Value)-1])
-			res.Params.fields = append(res.Params.fields, props)
+		keyValue := strings.Split(item, "=")
+		key := keyValue[0]
+		value := keyValue[1]
+
+		switch key {
+		case "paramname":
+			result.paramname = value
+		case "min":
+			result.min, _ = strconv.Atoi(value)
+			result.hasMin = true
+		case "max":
+			result.max, _ = strconv.Atoi(value)
+			result.hasMax = true
+		case "enum":
+			result.enum = strings.Split(value, "|")
+		case "default":
+			result.dflt = value
 		}
-		fmt.Printf(parastrObj.Name.Name)
-		//нужно бы еще заполнить опции валидации
-		writeWrapper(out, res)
-
-		apis[res.Owner] = append(apis[res.Owner], res)
-
 	}
+	return result
+}
 
-	for strct, valr := range apis {
-		writeHTTPHandlers(out, valr, strct)
-	}
-
+type tagParseResult struct {
+	required  bool
+	min       int
+	hasMin    bool
+	max       int
+	hasMax    bool
+	paramname string
+	enum      []string
+	dflt      string
 }
